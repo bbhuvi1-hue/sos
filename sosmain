@@ -359,16 +359,11 @@ def main():
     print(f"Saved CSV → {csv_path}")
 
     # --------- Plots ----------
-    plot_roc({"R4-SOS meta": p_meta_test, "LGBM": probs["LGBM (cal)"], "XGB": probs["XGB (cal)"], "CatBoost": probs["CatBoost"]}, yte,
-             os.path.join(OUT_DIR,"roc.png"))
-    plot_pr({"R4-SOS meta": p_meta_test, "LGBM": probs["LGBM (cal)"], "XGB": probs["XGB (cal)"], "CatBoost": probs["CatBoost"]}, yte,
-            os.path.join(OUT_DIR,"pr.png"))
-    plot_cal({"R4-SOS meta": p_meta_test, "LGBM": probs["LGBM (cal)"], "XGB": probs["XGB (cal)"], "CatBoost": probs["CatBoost"]}, yte,
-             os.path.join(OUT_DIR,"calibration.png"))
-    plot_confusions({"R4-SOS meta": p_meta_test, "LGBM": probs["LGBM (cal)"], "XGB": probs["XGB (cal)"]}, yte,
-                    {"R4-SOS meta": THR_STAR, "LGBM":0.5, "XGB":0.5}, os.path.join(OUT_DIR,"confusions.png"))
-    plot_ece_bars({"R4-SOS meta": p_meta_test, "LGBM (cal)": probs["LGBM (cal)"], "XGB (cal)": probs["XGB (cal)"], "CatBoost": probs["CatBoost"]}, yte,
-                  os.path.join(OUT_DIR,"ece_bars.png"))
+    plot_roc(probs, yte, os.path.join(OUT_DIR,"roc.png"))
+    plot_pr(probs, yte, os.path.join(OUT_DIR,"pr.png"))
+    plot_cal(probs, yte, os.path.join(OUT_DIR,"calibration.png"))
+    plot_confusions(probs, yte, thr_map, os.path.join(OUT_DIR,"confusions.png"))
+    plot_ece_bars(probs, yte, os.path.join(OUT_DIR,"ece_bars.png"))
     print(f"Saved outputs → {OUT_DIR}")
 
 if __name__ == "__main__":
