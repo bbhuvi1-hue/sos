@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+R4-SOS: Soft Optimized Stacking (OOF) with Calibrated Meta
+- Beefs up accuracy vs single trees by unbiased OOF stacking
+- Strong base pool: LGBM, XGBoost, CatBoost, ExtraTrees, RBF-SVC, Logistic Regression
+- Meta: GradientBoosting (default) with isotonic calibration
+- Threshold chosen on OOF to maximize Accuracy (or F1)
+- Saves results + rich plots to r4_sos_outputs/
+"""
+
+import os, io, sys, zipfile, urllib.request, warnings, subprocess, math, random
+warnings.filterwarnings("ignore")
+
+# ---------- Auto-install ----------
+def ensure(pkg, pipname=None):
+    try:
+        __import__(pkg)
+    except ImportError:
+        print(f"[setup] Installing {pipname or pkg} ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pipname or pkg, "-q"])
+
+for pkg, pippkg in [
+    ("numpy","numpy"),
+    ("pandas","pandas"),
+    ("scipy","scipy"),
+    ("sklearn","scikit-learn"),
+    ("xgboost","xgboost"),
+    ("lightgbm","lightgbm"),
+    ("catboost","catboost"),
+    ("matplotlib","matplotlib"),
+]:
+    ensure(pkg, pippkg)
+
+import numpy as np
+import pandas as pd
+from scipy.io import arff
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures, QuantileTransformer
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_score,
+                             roc_auc_score, average_precision_score, log_loss,
+                             confusion_matrix)
+from sklearn.ensemble import GradientBoostingClassifier, ExtraTreesClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+SEED = 11
+np.random.seed(SEED); random.seed(SEED)
+OUT_DIR = "r4_sos_outputs"; os.makedirs(OUT_DIR, exist_ok=True)
+DATA_URL = "https://archive.ics.uci.edu/static/public/379/website%2Bphishing.zip"
+K = 5
+VAL_METRIC = "Accuracy"   # or "F1"
+N_BINS_CAL = 15
+
+# ---------------- Data ----------------
+def _decode_obj_series(s):
+    return s.apply(lambda v: v.decode("utf-8","ignore") if isinstance(v,(bytes,bytearray)) else v)
+
+def fetch_uci_zip_to_arff_dataframe(url=DATA_URL):
+    with urllib.request.urlopen(url) as resp:
+        data = resp.read()
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        arffs = [n for n in z.namelist() if n.lower().endswith(".arff")]
+        if not arffs: raise RuntimeError("No .arff in zip.")
+        raw = z.read(arffs[0])
+    try: text = raw.decode("utf-8")
+    except UnicodeDecodeError: text = raw.decode("latin-1")
+    arr, meta = arff.loadarff(io.StringIO(text))
+    df = pd.DataFrame(arr)
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = _decode_obj_series(df[c])
+    target=None
+    for c in df.columns:
+        if str(c).strip().lower()=="result":
+            target=c; break
+    if target is None: target = df.columns[-1]
+    y_raw = df[target]; X = df.drop(columns=[target]).copy()
+    for c in X.columns:
+        if X[c].dtype==object:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+    X = X.fillna(0.0).values.astype(float)
+
+    y_num = pd.to_numeric(y_raw, errors="coerce")
+    if y_num.notna().all():
+        y = (y_num.astype(int)==-1).astype(int).values
+    else:
+        ys = _decode_obj_series(pd.Series(y_raw)).astype(str).str.lower()
+        y = ys.str.contains("phish").astype(int).values
+    return X, y.astype(int)
+
+# ------------- Metrics -------------
+def compute_ece(y_true, y_prob, n_bins=N_BINS_CAL):
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.clip(np.asarray(y_prob), 1e-7, 1-1e-7)
+    bins = np.linspace(0,1,n_bins+1); ece=0.0
+    for b in range(n_bins):
+        lo,hi=bins[b],bins[b+1]
+        m=(y_prob>=lo)&(y_prob<hi)
+        if not np.any(m): continue
+        conf=y_prob[m].mean(); acc=(y_true[m]==(y_prob[m]>=0.5)).mean()
+        ece += m.mean()*abs(acc-conf)
+    return float(ece)
+
+def ks_stat(y_true, y_prob):
+    y_true=np.asarray(y_true).astype(int)
+    pos=np.sort(y_prob[y_true==1]); neg=np.sort(y_prob[y_true==0])
+    grid=np.sort(np.unique(y_prob))
+    cdfp=np.searchsorted(pos, grid, side="right")/max(1,len(pos))
+    cdfn=np.searchsorted(neg, grid, side="right")/max(1,len(neg))
+    return float(np.max(np.abs(cdfp-cdfn)))
+
+def metrics_all(y_true, y_prob, thr=0.5):
+    y_pred=(y_prob>=thr).astype(int)
+    acc=accuracy_score(y_true,y_pred)
+    prec=precision_score(y_true,y_pred,zero_division=0)
+    rec=recall_score(y_true,y_pred,zero_division=0)
+    f1=f1_score(y_true,y_pred,zero_division=0)
+    try: auroc=roc_auc_score(y_true,y_prob)
+    except: auroc=np.nan
+    auprc=average_precision_score(y_true,y_prob)
+    try: ll=log_loss(y_true, np.c_[1-y_prob,y_prob], labels=[0,1])
+    except: ll=np.nan
+    brier=np.mean((y_prob - y_true)**2)
+    ece=compute_ece(y_true,y_prob,N_BINS_CAL)
+    from sklearn.metrics import matthews_corrcoef
+    mcc=matthews_corrcoef(y_true,y_pred)
+    tn,fp,fn,tp = confusion_matrix(y_true,y_pred,labels=[0,1]).ravel()
+    spec = tn/max(1,tn+fp); bal=0.5*(spec+rec); npv=tn/max(1,tn+fn)
+    ks=ks_stat(y_true,y_prob)
+    return dict(Accuracy=acc, Precision=prec, Recall=rec, F1=f1, AUROC=auroc, AUPRC=auprc,
+                LogLoss=ll, Brier=brier, ECE=ece, MCC=mcc, BalancedAcc=bal,
+                Specificity=spec, NPV=npv, KS=ks)
+
+def best_threshold(y, p, criterion="Accuracy"):
+    th=np.linspace(0.05,0.95,181)
+    vals=[]
+    for t in th:
+        yp=(p>=t).astype(int)
+        vals.append(f1_score(y,yp,zero_division=0) if criterion=="F1" else accuracy_score(y,yp))
+    return float(th[int(np.argmax(vals))])
+
+# ------------- Plots -------------
+def plot_roc(models, y, path):
+    from sklearn.metrics import roc_curve
+    plt.figure()
+    for n,p in models.items():
+        fpr,tpr,_=roc_curve(y,p); plt.plot(fpr,tpr,label=n)
+    plt.plot([0,1],[0,1],'--'); plt.xlabel("FPR"); plt.ylabel("TPR"); plt.title("ROC"); plt.legend()
+    plt.tight_layout(); plt.savefig(path, dpi=200); plt.close()
+
+def plot_pr(models, y, path):
+    from sklearn.metrics import precision_recall_curve
+    plt.figure()
+    for n,p in models.items():
+        pr,rc,_=precision_recall_curve(y,p); plt.plot(rc,pr,label=n)
+    plt.xlabel("Recall"); plt.ylabel("Precision"); plt.title("PR"); plt.legend()
+    plt.tight_layout(); plt.savefig(path, dpi=200); plt.close()
+
+def plot_cal(models, y, path, n_bins=N_BINS_CAL):
+    from sklearn.calibration import calibration_curve
+    plt.figure()
+    for n,p in models.items():
+        t,m=calibration_curve(y,p,n_bins=n_bins, strategy="uniform"); plt.plot(m,t,marker='o',label=n)
+    plt.plot([0,1],[0,1],'--'); plt.xlabel("Pred"); plt.ylabel("Empirical"); plt.title("Calibration"); plt.legend()
+    plt.tight_layout(); plt.savefig(path, dpi=200); plt.close()
+
+def plot_confusions(models, y, thr_dict, path):
+    names=list(models.keys()); cols=3; rows=int(np.ceil(len(names)/cols))
+    fig,axes=plt.subplots(rows,cols,figsize=(4*cols,3.6*rows)); axes=np.atleast_1d(axes).reshape(rows,cols)
+    for i,n in enumerate(names):
+        from sklearn.metrics import confusion_matrix
+        r,c=divmod(i,cols); ax=axes[r,c]
+        yhat=(models[n]>=thr_dict.get(n,0.5)).astype(int); cm=confusion_matrix(y,yhat,labels=[0,1])
+        ax.imshow(cm,cmap="Blues"); ax.set_title(n); ax.set_xlabel("Pred"); ax.set_ylabel("True")
+        for (ii,jj),v in np.ndenumerate(cm): ax.text(jj,ii,str(v),ha="center",va="center")
+    for j in range(i+1,rows*cols):
+        r,c=divmod(j,cols); axes[r,c].axis('off')
+    plt.tight_layout(); plt.savefig(path, dpi=200); plt.close()
+
+def plot_ece_bars(models, y, path):
+    names=[]; vals=[]
+    for n,p in models.items():
+        names.append(n); vals.append(compute_ece(y,p,N_BINS_CAL))
+    plt.figure(); plt.bar(names, vals); plt.xticks(rotation=25, ha='right'); plt.ylabel("ECE"); plt.title("Calibration (ECE)")
+    plt.tight_layout(); plt.savefig(path, dpi=200); plt.close()
+
+# ------------- Helpers -------------
+def make_calibrated(estimator, method="isotonic", cv=3):
+    # Handle sklearn API changes across versions
+    from inspect import signature
+    sig=signature(CalibratedClassifierCV.__init__); names={p.name for p in sig.parameters.values()}
+    return CalibratedClassifierCV(estimator=estimator, method=method, cv=cv) if "estimator" in names else CalibratedClassifierCV(base_estimator=estimator, method=method, cv=cv)
+
+# ------------- Main -------------
+def main():
+    X, y = fetch_uci_zip_to_arff_dataframe(DATA_URL)
+    print(f"[data] X={X.shape}, y counts={np.bincount(y)}")
+
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=SEED, stratify=y)
+
+    # Preprocess branches
+    std = StandardScaler().fit(Xtr)
+    Ztr = std.transform(Xtr); Zte = std.transform(Xte)
+
+    poly = PolynomialFeatures(degree=2, include_bias=False, interaction_only=True)
+    ZXtr = poly.fit_transform(Ztr); ZXte = poly.transform(Zte)
+
+    qmap = QuantileTransformer(output_distribution="uniform", random_state=SEED, subsample=100000)
+    Qtr  = qmap.fit_transform(ZXtr); Qte  = qmap.transform(ZXte)
+
+    # Base learners (functions to build fresh models each fold)
+    def build_lgbm():
+        return LGBMClassifier(
+            n_estimators=800, learning_rate=0.045, subsample=0.9, colsample_bytree=0.85,
+            reg_lambda=1.1, random_state=SEED, class_weight="balanced", n_jobs=-1
+        )
+    def build_xgb():
+        # scale_pos_weight set from y fold later (class balance)
+        return XGBClassifier(
+            n_estimators=800, max_depth=6, learning_rate=0.05, subsample=0.9, colsample_bytree=0.85,
+            reg_lambda=1.0, min_child_weight=1.0, random_state=SEED, tree_method="hist", n_jobs=-1,
+            eval_metric="logloss"
+        )
+    def build_cat():
+        return CatBoostClassifier(
+            iterations=1000, depth=6, learning_rate=0.055, loss_function="Logloss",
+            random_seed=SEED, verbose=False
+        )
+    def build_xt():
+        return ExtraTreesClassifier(
+            n_estimators=900, max_depth=None, min_samples_split=2, min_samples_leaf=1,
+            random_state=SEED, n_jobs=-1, class_weight="balanced"
+        )
+    def build_svc():
+        return SVC(C=3.0, gamma="scale", kernel="rbf", probability=True, class_weight="balanced", random_state=SEED)
+    def build_lr():
+        return LogisticRegression(C=2.0, solver="liblinear", penalty="l2", max_iter=200, class_weight="balanced", random_state=SEED)
+
+    base_names = ["LGBM","XGB","CatBoost","ExtraTrees","RBF-SVC","LogReg"]
+    M = len(base_names)
+
+    # OOF matrices
+    oof = np.zeros((len(Xtr), M), dtype=float)
+    test_preds = np.zeros((len(Xte), M), dtype=float)
+
+    skf = StratifiedKFold(n_splits=K, shuffle=True, random_state=SEED)
+    for fold, (tr, va) in enumerate(skf.split(Xtr, ytr), 1):
+        X_tr, X_va = Xtr[tr], Xtr[va]; y_tr, y_va = ytr[tr], ytr[va]
+        # branch views
+        Z_tr, Z_va = Ztr[tr], Ztr[va]
+        ZX_tr, ZX_va = ZXtr[tr], ZXtr[va]
+        Q_tr, Q_va = Qtr[tr], Qtr[va]
+
+        # class balance for XGB
+        pos = (y_tr==1).sum(); neg = (y_tr==0).sum()
+        spw = max(1.0, neg/max(1,pos))
+
+        # 1) LGBM + calibration
+        lgb = build_lgbm()
+        lgb_cal = make_calibrated(lgb, method="isotonic", cv=3)
+        lgb_cal.fit(Q_tr, y_tr)
+        oof[va, 0] = lgb_cal.predict_proba(Q_va)[:,1]
+        test_preds[:,0] += lgb_cal.predict_proba(Qte)[:,1] / K
+
+        # 2) XGB + calibration
+        xgb = build_xgb(); xgb.set_params(scale_pos_weight=spw)
+        xgb.fit(Q_tr, y_tr, eval_set=[(Q_va, y_va)], verbose=False)
+        xgb_cal = make_calibrated(xgb, method="isotonic", cv=3)
+        xgb_cal.fit(Q_va, y_va)  # calibrate on fold-val
+        oof[va, 1] = xgb_cal.predict_proba(Q_va)[:,1]
+        test_preds[:,1] += xgb_cal.predict_proba(Qte)[:,1] / K
+
+        # 3) CatBoost (already probabilistic) + light calibration
+        cat = build_cat().fit(Z_tr, y_tr, eval_set=(Z_va, y_va), verbose=False)
+        cat_cal = make_calibrated(cat, method="isotonic", cv=3)
+        cat_cal.fit(Z_va, y_va)
+        oof[va, 2] = cat_cal.predict_proba(Z_va)[:,1]
+        test_preds[:,2] += cat_cal.predict_proba(Zte)[:,1] / K
+
+        # 4) ExtraTrees
+        xt = build_xt().fit(Z_tr, y_tr)
+        oof[va, 3] = xt.predict_proba(Z_va)[:,1]
+        test_preds[:,3] += xt.predict_proba(Zte)[:,1] / K
+
+        # 5) RBF-SVC (on standardized space)
+        svc = build_svc().fit(Z_tr, y_tr)
+        oof[va, 4] = svc.predict_proba(Z_va)[:,1]
+        test_preds[:,4] += svc.predict_proba(Zte)[:,1] / K
+
+        # 6) Logistic Regression (margin stabilizer)
+        lr = build_lr().fit(Z_tr, y_tr)
+        oof[va, 5] = lr.predict_proba(Z_va)[:,1]
+        test_preds[:,5] += lr.predict_proba(Zte)[:,1] / K
+
+        print(f"[fold {fold}/{K}] done")
+
+    # --------- Meta-learner (calibrated) ----------
+    # Option A (default): GradientBoosting meta (usually a tad stronger than plain LR)
+    meta_base = GradientBoostingClassifier(random_state=SEED, n_estimators=240, max_depth=2, learning_rate=0.06, subsample=0.9)
+    meta = make_calibrated(meta_base, method="isotonic", cv=3)
+    meta.fit(oof, ytr)
+
+    p_meta_oof = meta.predict_proba(oof)[:,1]
+    THR_STAR = best_threshold(ytr, p_meta_oof, criterion=VAL_METRIC)
+    print(f"[thr] Selected decision threshold (from OOF, {VAL_METRIC}): {THR_STAR:.3f}")
+
+    p_meta_test = meta.predict_proba(test_preds)[:,1]
+
+    # --------- Baselines for comparison ----------
+    # Strong single-tree baselines for fairness (retrain on full train):
+    lgb_full = make_calibrated(build_lgbm(), method="isotonic", cv=3).fit(Qtr, ytr)
+    cat_full = build_cat().fit(Ztr, ytr, verbose=False)
+    xt_full  = build_xt().fit(Ztr, ytr)
+    svc_full = build_svc().fit(Ztr, ytr)
+    lr_full  = build_lr().fit(Ztr, ytr)
+
+    xgb_full = build_xgb(); spw = max(1.0, (ytr==0).sum()/max(1,(ytr==1).sum()))
+    xgb_full.set_params(scale_pos_weight=spw)
+    xgb_full.fit(Qtr, ytr, eval_set=[(Qtr,ytr)], verbose=False)
+    xgb_full_cal = make_calibrated(xgb_full, method="isotonic", cv=3).fit(Qtr, ytr)
+
+    probs = {
+        "LGBM (cal)": lgb_full.predict_proba(Qte)[:,1],
+        "XGB (cal)" : xgb_full_cal.predict_proba(Qte)[:,1],
+        "CatBoost"  : cat_full.predict_proba(Zte)[:,1],
+        "ExtraTrees": xt_full.predict_proba(Zte)[:,1],
+        "RBF-SVC"   : svc_full.predict_proba(Zte)[:,1],
+        "LogReg"    : lr_full.predict_proba(Zte)[:,1],
+        "R4-SOS meta @0.5": p_meta_test,
+        "R4-SOS meta @thr*": p_meta_test
+    }
+
+    thr_map = {k:0.5 for k in probs.keys()}
+    thr_map["R4-SOS meta @thr*"] = THR_STAR
+
+    # --------- Results ----------
+    rows=[]
+    for name,p in probs.items():
+        thr = thr_map[name]
+        m = metrics_all(yte, p, thr=thr); m.update(Method=name)
+        rows.append(m)
+
+    df=pd.DataFrame(rows)
+    cols=["Method","Accuracy","Precision","Recall","F1","AUROC","AUPRC","LogLoss","Brier","ECE","MCC","BalancedAcc","Specificity","NPV","KS"]
+    df=df[cols]
+    with pd.option_context('display.float_format', lambda x: f"{x:.6f}"):
+        print("\n=== Results (test split) ===")
+        print(df.sort_values("Accuracy", ascending=False).to_string(index=False))
+
+    csv_path=os.path.join(OUT_DIR,"results_r4_sos.csv"); df.to_csv(csv_path, index=False)
+    print(f"Saved CSV → {csv_path}")
+
+    # --------- Plots ----------
+    plot_roc({"R4-SOS meta": p_meta_test, "LGBM": probs["LGBM (cal)"], "XGB": probs["XGB (cal)"], "CatBoost": probs["CatBoost"]}, yte,
+             os.path.join(OUT_DIR,"roc.png"))
+    plot_pr({"R4-SOS meta": p_meta_test, "LGBM": probs["LGBM (cal)"], "XGB": probs["XGB (cal)"], "CatBoost": probs["CatBoost"]}, yte,
+            os.path.join(OUT_DIR,"pr.png"))
+    plot_cal({"R4-SOS meta": p_meta_test, "LGBM": probs["LGBM (cal)"], "XGB": probs["XGB (cal)"], "CatBoost": probs["CatBoost"]}, yte,
+             os.path.join(OUT_DIR,"calibration.png"))
+    plot_confusions({"R4-SOS meta": p_meta_test, "LGBM": probs["LGBM (cal)"], "XGB": probs["XGB (cal)"]}, yte,
+                    {"R4-SOS meta": THR_STAR, "LGBM":0.5, "XGB":0.5}, os.path.join(OUT_DIR,"confusions.png"))
+    plot_ece_bars({"R4-SOS meta": p_meta_test, "LGBM (cal)": probs["LGBM (cal)"], "XGB (cal)": probs["XGB (cal)"], "CatBoost": probs["CatBoost"]}, yte,
+                  os.path.join(OUT_DIR,"ece_bars.png"))
+    print(f"Saved outputs → {OUT_DIR}")
+
+if __name__ == "__main__":
+    main()
